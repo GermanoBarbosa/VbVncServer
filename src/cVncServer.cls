@@ -140,6 +140,8 @@ Private Declare Function RedrawWindow Lib "user32" (ByVal hWnd As Long, lprcUpda
 Private Declare Function OpenInputDesktop Lib "user32" (ByVal dwFlags As Long, ByVal fInherit As Boolean, ByVal dwDesiredAccess As Long) As Long
 Private Declare Function CloseDesktop Lib "user32" (ByVal hDesktop As Long) As Long
 Private Declare Function SetThreadDesktop Lib "user32" (ByVal hDesktop As Long) As Long
+Private Declare Function GetUserObjectInformation Lib "user32" Alias "GetUserObjectInformationW" (ByVal hObj As Long, ByVal nIndex As Long, pvInfo As Any, ByVal nLength As Long, lpnLengthNeeded As Long) As Long
+    Private Const UOI_NAME                                        As Long = 2
 Private Declare Function D3DKMTSetProcessSchedulingPriorityClass Lib "gdi32" (ByVal hProcess As Long, ByVal lPriority As Long) As Long
 Private Declare Function CreateDC Lib "gdi32" Alias "CreateDCW" (ByVal lpDriverName As Long, ByVal lpDeviceName As Long, ByVal lpOutput As Long, ByVal lpInitData As Long) As Long
 Private Declare Function GetDeviceCaps Lib "gdi32" (ByVal hdc As Long, ByVal nIndex As Long) As Long
@@ -837,7 +839,8 @@ Private Type UcsCaptureContext
     InSystemMemory      As Boolean
     Pitch               As Long
     Stride              As Long
-    GdiMode             As Boolean
+GdiMode             As Boolean
+    GdiSecureDesktop    As Boolean
     hScreenDC           As Long
     hMemDC              As Long
     hDib                As Long
@@ -2557,8 +2560,13 @@ Attribute TimerProc.VB_MemberFlags = "40"
     #If ImplConsole Then
         hProcess = m_uCaptureCtx.ConsoleCtx.ProcessInfo.hProcess
     #End If
-If hProcess = 0 And m_uCaptureCtx.Duplication Is Nothing And Not m_uCaptureCtx.GdiMode Then
-        frCaptureSetupDeviceIndex
+If hProcess = 0 Then
+If m_uCaptureCtx.Duplication Is Nothing And Not m_uCaptureCtx.GdiMode Then
+            frCaptureSetupDeviceIndex
+        ElseIf m_uCaptureCtx.GdiSecureDesktop And Not pvIsSecureDesktop() Then
+            '--- back on the normal desktop; restore DXGI capture
+            frCaptureSetupDeviceIndex
+        End If
     End If
     #If ImplConsole Then
         hProcess = m_uCaptureCtx.ConsoleCtx.ProcessInfo.hProcess
@@ -2738,8 +2746,11 @@ Private Function pvCaptureInit(uCtx As UcsCaptureContext, ByVal sDeviceName As S
         Set .Duplication = Nothing
         Set .StageTexture = Nothing
         Set .Context = Nothing
-        .Left = 0
+.Left = 0
         .Top = 0
+        Call pvCaptureTerminateGdi(uCtx)
+        .GdiMode = False
+        .GdiSecureDesktop = False
         #If ImplConsole Then
             If sDeviceName = "Console" Then
                 If .ConsoleCtx.ProcessInfo.hProcess <> 0 Then
@@ -2857,12 +2868,19 @@ EH:
     PrintError FUNC_NAME
 End Function
 '--- init GDI fallback capture (sem DXGI)
-Private Function pvCaptureInitGdi(uCtx As UcsCaptureContext) As Boolean
+Private Function pvCaptureInitGdi(uCtx As UcsCaptureContext, Optional ByVal bSecureDesktop As Boolean = False) As Boolean
     Const FUNC_NAME     As String = "pvCaptureInitGdi"
     Const DIB_RGB_COLORS As Long = 0
     Dim uBmpHeader      As BITMAPINFOHEADER
+Dim hDesktop        As Long
 
     On Error GoTo EH
+    '--- allow capture the secure desktop
+    hDesktop = OpenInputDesktop(0, 0, GENERIC_READ)
+    If hDesktop <> 0 Then
+        Call SetThreadDesktop(hDesktop)
+        Call CloseDesktop(hDesktop)
+    End If
     Call pvCaptureTerminateGdi(uCtx)
     With uCtx
         If .Width = 0 Or .Height = 0 Then
@@ -2882,12 +2900,42 @@ Private Function pvCaptureInitGdi(uCtx As UcsCaptureContext) As Boolean
         .hDib = CreateDIBSection(.hMemDC, uBmpHeader, DIB_RGB_COLORS, .lpBits, 0, 0)
         If .hDib <> 0 Then
             .hOldDib = SelectObject(.hMemDC, .hDib)
-            .GdiMode = True
+.GdiMode = True
+            .GdiSecureDesktop = bSecureDesktop
         End If
     End With
     '--- success
     pvCaptureInitGdi = uCtx.GdiMode
     GoTo QH
+QH:
+    Exit Function
+EH:
+    PrintError FUNC_NAME
+End Function
+
+Private Function pvIsSecureDesktop() As Boolean
+    Const FUNC_NAME     As String = "pvIsSecureDesktop"
+    Dim hDesktop        As Long
+    Dim sName           As String
+    Dim lLen            As Long
+
+    On Error GoTo EH
+    '--- use the active input desktop (switches to the secure desktop during UAC / lock)
+    hDesktop = OpenInputDesktop(0, 0, GENERIC_READ)
+    If hDesktop = 0 Then
+        GoTo QH
+    End If
+    sName = Space$(256)
+    If GetUserObjectInformation(hDesktop, UOI_NAME, ByVal StrPtr(sName), LenB(sName), lLen) = 0 Then
+        Call CloseDesktop(hDesktop)
+        GoTo QH
+    End If
+    Call CloseDesktop(hDesktop)
+    sName = Left$(sName, InStr(1, sName, vbNullChar) - 1)
+    '--- secure desktops used by UAC / lock screen: 'Winlogon', 'Screen-saver', etc.
+    If StrComp(sName, "Default", vbTextCompare) <> 0 Then
+        pvIsSecureDesktop = True
+    End If
 QH:
     Exit Function
 EH:
@@ -2913,7 +2961,8 @@ Private Sub pvCaptureTerminateGdi(uCtx As UcsCaptureContext)
             Call ReleaseDC(0, .hScreenDC)
             .hScreenDC = 0
         End If
-        .GdiMode = False
+.GdiMode = False
+        .GdiSecureDesktop = False
     End With
 End Sub
 
@@ -2981,8 +3030,12 @@ With uFrame
         If hResult = DXGI_ERROR_WAIT_TIMEOUT Then
             GoTo QH
         End If
-        If hResult < 0 Then
+If hResult < 0 Then
             Set .Duplication = Nothing
+            If pvIsSecureDesktop() Then
+                '--- DXGI cannot capture the secure desktop (UAC); fall back to GDI
+Call pvCaptureInitGdi(uCtx, True)
+            End If
             GoTo QH
         End If
         If uFrameInfo.LastPresentTime.LowPart <> 0 Or uFrameInfo.LastPresentTime.HighPart <> 0 Then
