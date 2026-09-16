@@ -196,7 +196,7 @@ Private Declare Function IPropertyBag2_Write_Proxy Lib "windowscodecs" (ByVal pP
     Private Declare Function SetFilePointerEx Lib "kernel32" (ByVal hFile As Long, ByVal liDistanceToMove As Currency, ByVal lpNewFilePointer As Long, ByVal dwMoveMethod As Long) As Long
     Private Declare Function SetEndOfFile Lib "kernel32" (ByVal hFile As Long) As Long
 #End If
-Private Declare Function D3D11CreateDevice Lib "d3d11" (ByVal pAdapter As IUnknown, ByVal DriverType As D3D_DRIVER_TYPE, ByVal Software As Long, ByVal Flags As D3D11_CREATE_DEVICE_FLAG, pFeatureLevels As Any, ByVal FeatureLevels As Long, ByVal SDKVersion As Long, ppDevice As ID3D11Device, pFeatureLevel As D3D_FEATURE_LEVEL, ppImmediateContext As ID3D11DeviceContext) As VBHRESULT
+Private Declare Function D3D11CreateDevice Lib "d3d11" (ByVal pAdapter As IUnknown, ByVal DriverType As D3D_DRIVER_TYPE, ByVal Software As Long, ByVal flags As D3D11_CREATE_DEVICE_FLAG, pFeatureLevels As Any, ByVal FeatureLevels As Long, ByVal SDKVersion As Long, ppDevice As ID3D11Device, pFeatureLevel As D3D_FEATURE_LEVEL, ppImmediateContext As ID3D11DeviceContext) As VBHRESULT
 Private Declare Function CreateDXGIFactory1 Lib "dxgi" (riid As VBD3D11.VBGUID, ppFactory As IDXGIFactory1) As VBHRESULT
 #If ImplConsole Then
     Private Declare Function AllocConsole Lib "kernel32" () As Long
@@ -220,7 +220,7 @@ Private Declare Function CreateDXGIFactory1 Lib "dxgi" (riid As VBD3D11.VBGUID, 
     Private Declare Function SetTextColor Lib "gdi32" (ByVal hdc As Long, ByVal crColor As Long) As Long
     Private Declare Function SetBkColor Lib "gdi32" (ByVal hdc As Long, ByVal crColor As Long) As Long
     Private Declare Function SetBkMode Lib "gdi32" (ByVal hdc As Long, ByVal nBkMode As Long) As Long
-    Private Declare Function TextOutW Lib "gdi32" (ByVal hdc As Long, ByVal x As Long, ByVal y As Long, ByVal lpString As Long, ByVal nCount As Long) As Long
+    Private Declare Function TextOutW Lib "gdi32" (ByVal hdc As Long, ByVal X As Long, ByVal Y As Long, ByVal lpString As Long, ByVal nCount As Long) As Long
     Private Declare Function GetTextMetrics Lib "gdi32" Alias "GetTextMetricsW" (ByVal hdc As Long, lpMetrics As TEXTMETRICW) As Long
     Private Declare Function CreateSolidBrush Lib "gdi32" (ByVal crColor As Long) As Long
     Private Declare Function CreateDIBSection Lib "gdi32" (ByVal hdc As Long, lpBitsInfo As Any, ByVal wUsage As Long, lpBits As Long, ByVal Handle As Long, ByVal dw As Long) As Long
@@ -277,8 +277,8 @@ Private Type KEYBOARD_INPUT
 End Type
 
 Private Type COORD
-    x                   As Integer
-    y                   As Integer
+    X                   As Integer
+    Y                   As Integer
 End Type
 
 Private Type SMALL_RECT
@@ -777,6 +777,8 @@ Private m_uClientPointerEvent   As RfbClientPointerEvent
 Private m_uClientCutText        As RfbClientCutText
 Private m_uCaptureCtx           As UcsCaptureContext
 Private m_uCaptureFrame         As UcsCaptureFrame
+Private m_lUltCursorShapeSize   As Long
+Private m_bCursorPendente       As Boolean
 Private m_pTimer                As IUnknown
 #If ImplZlib Then
     Private m_oZipArchive       As cZipArchive
@@ -883,7 +885,7 @@ Private Type UcsTightTransfer
     UncompressedSize    As Long
     Offset              As Currency
     DataSize            As Long
-    Flags               As Long
+    flags               As Long
     ModificationTime    As Currency
 End Type
 
@@ -893,7 +895,7 @@ End Type
 
 Private Sub PrintError(sFunction As String)
     #If ImplUseDebugLog Then
-        DebugLog MODULE_NAME, sFunction & "(" & Erl & ")", Err.Description & " &H" & Hex$(Err.Number), vbLogEventTypeError
+        DebugLog MODULE_NAME, sFunction & "(" & Erl & ")", Err.Description & " &H" & hex$(Err.Number), vbLogEventTypeError
     #Else
         Debug.Print "Critical error: " & Err.Description & " [" & MODULE_NAME & "." & sFunction & "]"
     #End If
@@ -1029,6 +1031,7 @@ Friend Function frNewConnection(oSocket As cAsyncSocket, oParent As cVncServer) 
         GoTo QH
     End If
     m_eState = uscStaExpectProtocolVersion
+    m_bCursorPendente = True
     '--- init WIC state
     If WICCreateImagingFactory_Proxy(WINCODEC_SDK_VERSION2, m_pWicFactory) < 0 Then
         Call WICCreateImagingFactory_Proxy(WINCODEC_SDK_VERSION1, m_pWicFactory)
@@ -1054,6 +1057,10 @@ Friend Function frNewConnection(oSocket As cAsyncSocket, oParent As cVncServer) 
 QH:
 End Function
 
+Friend Property Get LastCursorShapeSize() As Long
+    LastCursorShapeSize = m_lUltCursorShapeSize
+End Property
+
 Friend Sub frCloseConnection(oConn As cVncServer)
     If Not oConn Is Nothing Then
         On Error Resume Next
@@ -1068,6 +1075,7 @@ Friend Sub frCloseConnection(oConn As cVncServer)
             Set .StageTexture = Nothing
             Set .Context = Nothing
         End With
+        m_lUltCursorShapeSize = 0
         Set m_pTimer = Nothing
         m_oSocket.AsyncSelect ucsSfdAll
     End If
@@ -1666,7 +1674,7 @@ Private Function pvHandleClientMessage(uInput As UcsBuffer) As Boolean
                 .Pos = .Pos + 4
                 With uTightTransfer
                     pvBufferReadUtf8 uInput, .Path
-                    pvBufferReadLong uInput, .Flags
+                    pvBufferReadLong uInput, .flags
                     pvBufferReadCurrency uInput, .Offset
                 End With
             Case rfbMsgTightUploadDataRequest
@@ -1695,7 +1703,7 @@ Private Function pvHandleClientMessage(uInput As UcsBuffer) As Boolean
                 End If
                 .Pos = .Pos + 4
                 With uTightTransfer
-                    pvBufferReadLong uInput, .Flags, Size:=2
+                    pvBufferReadLong uInput, .flags, Size:=2
                     pvBufferReadCurrency uInput, .ModificationTime
                 End With
             Case rfbMsgTightDownloadStartRequest
@@ -1753,7 +1761,7 @@ Private Function pvHandleClientMessage(uInput As UcsBuffer) As Boolean
                 End With
             Case Else
                 #If ImplUseDebugLog Then
-                    DebugLog MODULE_NAME, FUNC_NAME, "Unknown tight file transfer message (&H" & Hex$(uTightTransfer.MessageType) & ")"
+                    DebugLog MODULE_NAME, FUNC_NAME, "Unknown tight file transfer message (&H" & hex$(uTightTransfer.MessageType) & ")"
                 #End If
                 uTightTransfer.MessageType = 0
                 '--- flush
@@ -1838,7 +1846,7 @@ Private Function pvHandleKeyEvent(uEvent As RfbClientKeyEvent) As Boolean
 QH:
     Exit Function
 EH:
-    PrintError FUNC_NAME & "(uEvent.Key=&H" & Hex$(uEvent.Key) & ")"
+    PrintError FUNC_NAME & "(uEvent.Key=&H" & hex$(uEvent.Key) & ")"
 End Function
 
 Private Function pvMapToVirtualKey(ByVal lKey As Long, nVk As Integer, bExtended As Boolean) As Boolean
@@ -2411,7 +2419,7 @@ Private Function pvHandleTightFileTransfer(uOutput As UcsBuffer, uMsg As UcsTigh
         pvBufferWriteBlob uOutput, pvArrayPtr(uList.Data), uList.Size
     Case rfbMsgTightUploadStartRequest
         sFile = Mid$(uMsg.Path, 2)
-        If pvCheckHResult(pvCreateStreamOnFile(sFile, STGM_WRITE Or IIf((uMsg.Flags And 1) <> 0, STGM_CREATE, 0), m_pFtpRecvStream), FUNC_NAME) < 0 Then
+        If pvCheckHResult(pvCreateStreamOnFile(sFile, STGM_WRITE Or IIf((uMsg.flags And 1) <> 0, STGM_CREATE, 0), m_pFtpRecvStream), FUNC_NAME) < 0 Then
             GoTo Failed
         End If
         If pvCheckHResult(IStream_Seek(m_pFtpRecvStream, uMsg.Offset, STREAM_SEEK_SET), FUNC_NAME) < 0 Then
@@ -2575,8 +2583,10 @@ If hProcess <> 0 Or Not m_uCaptureCtx.Duplication Is Nothing Or m_uCaptureCtx.Gd
         m_uCaptureFrame.NumTiles = 0
         m_uCaptureFrame.NumMoveRects = 0
         m_uCaptureFrame.PointerShapeBufferSize = 0
-        m_uCaptureFrame.PointerShapeBufferSize = 0
         If pvCaptureFrame(m_uCaptureCtx, m_uCaptureFrame) Then
+            If m_uCaptureFrame.PointerShapeBufferSize > 0 Then
+                m_lUltCursorShapeSize = m_uCaptureFrame.PointerShapeBufferSize
+            End If
             For Each oConn In m_cConnections
                 oConn.frNotifySendFrame m_uCaptureFrame
             Next
@@ -2614,13 +2624,21 @@ QH:
 End Function
 
 Friend Function frNotifySendFrame(uCaptureFrame As UcsCaptureFrame) As Boolean
+    Dim lShapeSize      As Long
+    Dim bEnviouCursor   As Boolean
+
+    '--- cliente novo ainda nao recebeu cursor: reenvia o ultimo shape conhecido
+    lShapeSize = uCaptureFrame.PointerShapeBufferSize
+    If m_bCursorPendente And lShapeSize = 0 And pvParent.LastCursorShapeSize > 0 Then
+        uCaptureFrame.PointerShapeBufferSize = pvParent.LastCursorShapeSize
+    End If
     If m_uClientFramebufferUpdate.MessageType = 0 Then
         GoTo QH
     ElseIf Not pvHasSupport(rfbEncRaw) Then
         If Not pvSendEmptyFramebufferUpdate(m_uSendBuffer(ucsChaFrame)) Then
             GoTo QH
         End If
-    ElseIf uCaptureFrame.NumTiles + uCaptureFrame.NumMoveRects + uCaptureFrame.PointerShapeBufferSize = 0 And uCaptureFrame.PointerPosition.Position.x = -1 Then
+    ElseIf uCaptureFrame.NumTiles + uCaptureFrame.NumMoveRects + uCaptureFrame.PointerShapeBufferSize = 0 And uCaptureFrame.PointerPosition.Position.X = -1 Then
         '--- do nothing
     Else
         If m_uSendBuffer(ucsChaFrame).Paused And m_uSendBuffer(ucsChaFrame).Size > LNG_MAX_BUFFER_SIZE Then
@@ -2629,10 +2647,15 @@ Friend Function frNotifySendFrame(uCaptureFrame As UcsCaptureFrame) As Boolean
         If Not pvCaptureSend(uCaptureFrame, m_uSendBuffer(ucsChaFrame)) Then
             GoTo QH
         End If
+        bEnviouCursor = (uCaptureFrame.PointerShapeBufferSize > 0)
+    End If
+    If bEnviouCursor Then
+        m_bCursorPendente = False
     End If
     '--- success
     frNotifySendFrame = True
 QH:
+    uCaptureFrame.PointerShapeBufferSize = lShapeSize
 End Function
 
 Friend Function frNotifyAfterSendFrame() As Boolean
@@ -2669,6 +2692,7 @@ Friend Sub frCaptureSetupDeviceIndex(Optional ByVal Rotate As Long)
             oConn.frNotifyChangeDesktopSize
         Next
     End If
+    m_lUltCursorShapeSize = 0
 End Sub
 
 Private Function pvCaptureEnumDevices() As Collection
@@ -2995,7 +3019,8 @@ With uFrame
                 .DirtyRects(0).Right = uCtx.Width
                 .DirtyRects(0).Bottom = uCtx.Height
                 .PointerShapeBufferSize = 0
-                .PointerPosition.Position.x = -1
+                m_lUltCursorShapeSize = 0
+                .PointerPosition.Position.X = -1
                 lSize = uCtx.Width * 4
                 pvBufferWriteBlob .DirtyBuffers(0), uCtx.lpBits, uCtx.Height * lSize
             End With
@@ -3206,11 +3231,11 @@ Private Function pvCaptureSend(uFrame As UcsCaptureFrame, uOutput As UcsBuffer) 
         #End If
         pvArrayAllocate baRow, (LNG_TILE_SIZE + 1) * 4, FUNC_NAME & ".baRow"
         '--- send pointer
-        If .PointerPosition.Position.x >= 0 And pvHasSupport(rfbEncPsPointerPosition) Then
+        If .PointerPosition.Position.X >= 0 And pvHasSupport(rfbEncPsPointerPosition) Then
             If .PointerPosition.Visible Then
-                lX = .PointerPosition.Position.x + .PointerInfo.HotSpot.x
-                lY = .PointerPosition.Position.y + .PointerInfo.HotSpot.y
-                .PointerPosition.Position.x = -1
+                lX = .PointerPosition.Position.X + .PointerInfo.HotSpot.X
+                lY = .PointerPosition.Position.Y + .PointerInfo.HotSpot.Y
+                .PointerPosition.Position.X = -1
             Else
                 lX = -1
             End If
@@ -3232,8 +3257,8 @@ Private Function pvCaptureSend(uFrame As UcsCaptureFrame, uOutput As UcsBuffer) 
                 End With
                 pvBufferWriteBlob uOutput, VarPtr(uUpdate), sizeof_RfbServerFramebufferUpdate
                 With uRectangle
-                    .XPosition = pvNetworkShort(uFrame.PointerInfo.HotSpot.x)
-                    .YPosition = pvNetworkShort(uFrame.PointerInfo.HotSpot.y)
+                    .XPosition = pvNetworkShort(uFrame.PointerInfo.HotSpot.X)
+                    .YPosition = pvNetworkShort(uFrame.PointerInfo.HotSpot.Y)
                     .Width = pvNetworkShort(uFrame.PointerInfo.Width)
                     .Height = pvNetworkShort(uFrame.PointerInfo.Height)
                     If uFrame.PointerInfo.Type = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR And pvHasSupport(rfbEncPsCursorWithAlpha) Then
@@ -3312,8 +3337,8 @@ Private Function pvCaptureSend(uFrame As UcsCaptureFrame, uOutput As UcsBuffer) 
             End With
             uRectangle.EncodingType = pvNetworkLong(rfbEncCopyRect)
             pvBufferWriteBlob uOutput, VarPtr(uRectangle), sizeof_RfbServerRectangle
-            pvBufferWriteLong uOutput, .MoveRects(lIdx).SourcePoint.x, Size:=2
-            pvBufferWriteLong uOutput, .MoveRects(lIdx).SourcePoint.y, Size:=2
+            pvBufferWriteLong uOutput, .MoveRects(lIdx).SourcePoint.X, Size:=2
+            pvBufferWriteLong uOutput, .MoveRects(lIdx).SourcePoint.Y, Size:=2
         Next
         For lIdx = 0 To .NumTiles - 1
             #If ImplUseDebugLog Then
@@ -3747,7 +3772,7 @@ Private Function pvConsoleRender(uCtx As UcsConsoleContext) As Boolean
         If GetConsoleScreenBufferInfo(.hConOut, .ScreenInfo) = 0 Then
             Exit Function
         End If
-        bDirty = uPrevScreen.dwCursorPosition.x <> .ScreenInfo.dwCursorPosition.x Or uPrevScreen.dwCursorPosition.y <> .ScreenInfo.dwCursorPosition.y
+        bDirty = uPrevScreen.dwCursorPosition.X <> .ScreenInfo.dwCursorPosition.X Or uPrevScreen.dwCursorPosition.Y <> .ScreenInfo.dwCursorPosition.Y
         uPrevInfo = .CharInfo
         uRegion.Right = LNG_CONSOLE_COLS - 1
         uRegion.Bottom = LNG_CONSOLE_ROWS - 1
@@ -3758,7 +3783,7 @@ Private Function pvConsoleRender(uCtx As UcsConsoleContext) As Boolean
             For lCol = 0 To LNG_CONSOLE_COLS - 1
                 lIdx = lRow * LNG_CONSOLE_COLS + lCol
                 If uPrevInfo(lIdx).UnicodeChar <> .CharInfo(lIdx).UnicodeChar Or uPrevInfo(lIdx).Attributes <> .CharInfo(lIdx).Attributes _
-                        Or bDirty And uPrevScreen.dwCursorPosition.x = lCol And uPrevScreen.dwCursorPosition.y = lRow Then
+                        Or bDirty And uPrevScreen.dwCursorPosition.X = lCol And uPrevScreen.dwCursorPosition.Y = lRow Then
                     lAttr = .CharInfo(lIdx).Attributes
                     lFg = m_aColors(lAttr And &HF)
                     lBg = m_aColors((lAttr \ &H10) And &HF)
@@ -3781,9 +3806,9 @@ Private Function pvConsoleRender(uCtx As UcsConsoleContext) As Boolean
             Next
         Next
         If bDirty Then
-            uRect.Left = .ScreenInfo.dwCursorPosition.x * .CellWidth
+            uRect.Left = .ScreenInfo.dwCursorPosition.X * .CellWidth
             uRect.Right = uRect.Left + .CellWidth
-            uRect.Bottom = (.ScreenInfo.dwCursorPosition.y + 1) * .CellHeight
+            uRect.Bottom = (.ScreenInfo.dwCursorPosition.Y + 1) * .CellHeight
             uRect.Top = uRect.Bottom - 2
             hBrush = CreateSolidBrush(m_aColors(7))
             Call FillRect(.hMemDC, uRect, hBrush)
@@ -4734,12 +4759,12 @@ End Function
 
 Private Function pvThunkIdeOwner(hIdeOwner As Long) As Boolean
     #If Not ImplNoIdeProtection Then
-        Dim lProcessID      As Long
+        Dim lProcessId      As Long
         
         Do
             hIdeOwner = FindWindowEx(0, hIdeOwner, StrPtr("IDEOwner"), 0)
-            Call GetWindowThreadProcessId(hIdeOwner, lProcessID)
-        Loop While hIdeOwner <> 0 And lProcessID <> GetCurrentProcessId()
+            Call GetWindowThreadProcessId(hIdeOwner, lProcessId)
+        Loop While hIdeOwner <> 0 And lProcessId <> GetCurrentProcessId()
     #End If
     pvThunkIdeOwner = True
 End Function
