@@ -135,6 +135,9 @@ Private Declare Function CloseHandle Lib "kernel32" (ByVal hObject As Long) As L
 Private Declare Sub mouse_event Lib "user32" (ByVal dwFlags As Long, ByVal dx As Long, ByVal dy As Long, ByVal cButtons As Long, ByVal dwExtraInfo As Long)
 Private Declare Function SendInput Lib "user32" (ByVal nInputs As Long, pInputs As Any, ByVal cbSize As Long) As Long
 Private Declare Function MapVirtualKeyA Lib "user32" (ByVal uCode As Long, ByVal uMapType As Long) As Long
+'--- SAS (Ctrl+Alt+Del): carrega sas.dll do System32 e chama SendSAS por ponteiro
+Private Declare Function LoadLibraryA Lib "kernel32" (ByVal lpLibFileName As String) As Long
+Private Declare Function pvGetProcAddress Lib "kernel32" Alias "GetProcAddress" (ByVal hModule As Long, ByVal lpProcName As String) As Long
 Private Declare Function GetSystemMetrics Lib "user32" (ByVal nIndex As Long) As Long
 Private Declare Function RedrawWindow Lib "user32" (ByVal hWnd As Long, lprcUpdate As Any, ByVal hrgnUpdate As Long, ByVal fuRedraw As Long) As Long
 Private Declare Function OpenInputDesktop Lib "user32" (ByVal dwFlags As Long, ByVal fInherit As Boolean, ByVal dwDesiredAccess As Long) As Long
@@ -773,6 +776,11 @@ Private m_uClientPixelFormat    As RfbClientSetPixelFormat
 Private m_uClientEncodings      As RfbClientSetEncodings
 Private m_uClientFramebufferUpdate As RfbClientFramebufferUpdateRequest
 Private m_uClientKeyEvent       As RfbClientKeyEvent
+'--- SAS (Ctrl+Alt+Del)
+Private m_bSasLoaded            As Boolean
+Private m_lSasProc              As Long
+Private m_bCadCtrl              As Boolean
+Private m_bCadAlt               As Boolean
 Private m_uClientPointerEvent   As RfbClientPointerEvent
 Private m_uClientCutText        As RfbClientCutText
 Private m_uCaptureCtx           As UcsCaptureContext
@@ -1032,6 +1040,9 @@ Friend Function frNewConnection(oSocket As cAsyncSocket, oParent As cVncServer) 
     End If
     m_eState = uscStaExpectProtocolVersion
     m_bCursorPendente = True
+    '--- novo cliente: zera o estado dos modificadores do combo Ctrl+Alt+Del
+    m_bCadCtrl = False
+    m_bCadAlt = False
     '--- init WIC state
     If WICCreateImagingFactory_Proxy(WINCODEC_SDK_VERSION2, m_pWicFactory) < 0 Then
         Call WICCreateImagingFactory_Proxy(WINCODEC_SDK_VERSION1, m_pWicFactory)
@@ -1804,6 +1815,65 @@ EH:
     PrintError FUNC_NAME
 End Function
 
+Private Function pvCallProc1(ByVal lProc As Long, ByVal lArg As Long) As Long
+    Const CC_STDCALL    As Long = 4
+    Dim vType(0 To 0)   As Integer
+    Dim vPtr(0 To 0)    As Long
+    Dim vArg            As Variant
+    Dim vRet            As Variant
+    '
+    vArg = lArg
+    vType(0) = vbLong
+    vPtr(0) = VarPtr(vArg)
+    '--- com pvInstance=0 o DispCallFunc chama o endereco em oVft; com
+    '--- pvInstance nao-nulo ele trataria o valor como interface (vtable)
+    pvCallProc1 = DispCallFunc(0, lProc, CC_STDCALL, vbEmpty, 1, vType(0), vPtr(0), vRet)
+End Function
+
+'--- Gera o SAS (Ctrl+Alt+Del) via SendSAS(FALSE) do sas.dll: o Windows ignora
+'--- o Ctrl+Alt+Del injetado por SendInput. Exige SeTcbPrivilege (agente
+'--- rodando como SYSTEM pelo servico) e a politica SoftwareSASGeneration
+'--- permitindo servicos (garantida pelo servico no start).
+Private Function pvSendSAS() As Boolean
+    Const FUNC_NAME     As String = "pvSendSAS"
+    Dim sBuf            As String
+    Dim sDll            As String
+    Dim lLen            As Long
+    Dim hLib            As Long
+    Dim hResult         As Long
+    '
+    On Error GoTo EH
+    If Not m_bSasLoaded Then
+        sBuf = String$(260, vbNullChar)
+        lLen = APIGetSystemDirectory(StrPtr(sBuf), Len(sBuf))
+        If lLen > 0 Then
+            sDll = Left$(sBuf, lLen) & "\sas.dll"
+            hLib = LoadLibraryA(sDll)
+            If hLib <> 0 Then
+                m_lSasProc = pvGetProcAddress(hLib, "SendSAS")
+            End If
+        End If
+        '--- so marca como carregado se resolveu, para tentar de novo depois
+        m_bSasLoaded = (m_lSasProc <> 0)
+        #If ImplUseDebugLog Then
+            DebugLog MODULE_NAME, FUNC_NAME, "sas.dll=" & sDll & " SendSAS=&H" & Hex$(m_lSasProc)
+        #End If
+    End If
+    If m_lSasProc = 0 Then
+        GoTo QH
+    End If
+    '--- SendSAS(AsUser = FALSE)
+    hResult = pvCallProc1(m_lSasProc, 0)
+    pvSendSAS = (hResult = 0)
+    #If ImplUseDebugLog Then
+        DebugLog MODULE_NAME, FUNC_NAME, "SendSAS hr=&H" & Hex$(hResult)
+    #End If
+QH:
+    Exit Function
+EH:
+    PrintError FUNC_NAME
+End Function
+
 Private Function pvHandleKeyEvent(uEvent As RfbClientKeyEvent) As Boolean
     Const FUNC_NAME     As String = "pvHandleKeyEvent"
     Const UNICODE_FLAG  As Long = &H1000000
@@ -1814,6 +1884,21 @@ Private Function pvHandleKeyEvent(uEvent As RfbClientKeyEvent) As Boolean
     #If ImplUseDebugLog Then
 '        DebugLog MODULE_NAME, FUNC_NAME, "uEvent.Key=&H" & Hex$(uEvent.Key) & ", uEvent.DownFlag=" & uEvent.DownFlag
     #End If
+    '--- Ctrl+Alt+Del: o Windows ignora o SAS sintetizado por SendInput; gera
+    '--- via sas.dll e nao injeta as teclas do combo.
+    Select Case uEvent.Key
+    Case &HFFE3&, &HFFE4& '--- Control_L / Control_R
+        m_bCadCtrl = (uEvent.DownFlag <> 0)
+    Case &HFFE9&, &HFFEA& '--- Alt_L / Alt_R
+        m_bCadAlt = (uEvent.DownFlag <> 0)
+    Case &HFFFF& '--- Delete
+        If uEvent.DownFlag <> 0 And m_bCadCtrl And m_bCadAlt Then
+            Call pvSendSAS
+            '--- success
+            pvHandleKeyEvent = True
+            GoTo QH
+        End If
+    End Select
     #If ImplConsole Then
         If pvParent.frConsoleHandleKeyEvent(uEvent) Then
             '--- success
