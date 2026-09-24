@@ -52,3 +52,22 @@ The snippet above allows optionally starting the built-in in your LOB applicatio
 Please when copy/pasting the sample code  use common sense and change the prefix of these environment variables to include your LOB application name.
 
 To reduce footprint on final executable you can optionally exclude `cZipArchive.cls` from your project by using `VNC_NO_ZLIB = 1` in conditional compilation settings which will remove (or reduce) some of the server functionalities. Similarly, the administrative console can be excluded with `VNC_NO_CONSOLE = 1`.
+
+### Monitor selection
+
+`InitControl` opens a **loopback** control channel to pick which monitor is captured (one at a time). Line protocol (ASCII, `\n`-terminated):
+
+- `LIST` → `OK <count> <active> <i>:<name>:<W>x<H>:<x>,<y> ...`
+- `SET <index>` → `OK <index> <W>x<H>` or `ERRO <reason>`
+- `STATUS` → `OK <active> <W>x<H>`
+
+```
+Private Sub Form_Load()
+    Set m_oServer = New cVncServer
+    If m_oServer.Init("0.0.0.0", 35901, "senha") Then
+        m_oServer.InitControl 35904, "127.0.0.1"
+    End If
+End Sub
+```
+
+The framebuffer becomes the physical resolution of the selected output and connected clients are notified through the `DesktopSize` pseudo-encoding (the viewer resizes itself). Pointer events are normalized to the virtual desktop (`MOUSEEVENTF_VIRTUALDESK`), so clicks work on secondary monitors; with mixed DPI the origin/size are converted to physical pixels (`DESKTOPHORZRES`/`DESKTOPVERTRES`). The GDI fallback (Windows 7 / secure desktop) captures the selected output's device DC when available, falling back to the primary screen.

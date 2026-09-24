@@ -54,9 +54,15 @@ Private Const MOUSEEVENTF_MIDDLEDOWN        As Long = &H20
 Private Const MOUSEEVENTF_MIDDLEUP          As Long = &H40
 Private Const MOUSEEVENTF_WHEEL             As Long = &H800
 Private Const MOUSEEVENTF_ABSOLUTE          As Long = &H8000&
+Private Const MOUSEEVENTF_VIRTUALDESK       As Long = &H4000&
 '--- for GetSystemMetrics
 Private Const SM_CXSCREEN                   As Long = 0
 Private Const SM_CYSCREEN                   As Long = 1
+'--- desktop virtual (mapeamento do mouse em monitores secundarios)
+Private Const SM_XVIRTUALSCREEN             As Long = 76
+Private Const SM_YVIRTUALSCREEN             As Long = 77
+Private Const SM_CXVIRTUALSCREEN            As Long = 78
+Private Const SM_CYVIRTUALSCREEN            As Long = 79
 Private Const SM_SWAPBUTTON                 As Long = 23
 '--- for RedrawWindow
 Private Const RDW_INVALIDATE                As Long = &H1
@@ -768,6 +774,12 @@ Private m_lParentWeakRef        As Long
 Private m_eState                As UcsProtocolStateEnum
 Private WithEvents m_oSocket    As cAsyncSocket
 Attribute m_oSocket.VB_VarHelpID = -1
+'--- canal de controle local (selecao de monitor)
+Private WithEvents m_oCtrlSocket As cAsyncSocket
+Attribute m_oCtrlSocket.VB_VarHelpID = -1
+Private WithEvents m_oCtrlConn As cAsyncSocket
+Attribute m_oCtrlConn.VB_VarHelpID = -1
+Private m_sCtrlRecv              As String
 Private m_uRecvBuffer           As UcsBuffer
 Private m_uSendBuffer(0 To ucsChaMax) As UcsBuffer
 Private m_eSecurityType         As RfbSecurityTypeEnum
@@ -852,6 +864,7 @@ Private Type UcsCaptureContext
 GdiMode             As Boolean
     GdiSecureDesktop    As Boolean
     hScreenDC           As Long
+    GdiDeviceDC         As Boolean
     hMemDC              As Long
     hDib                As Long
     lpBits              As Long
@@ -1000,6 +1013,77 @@ Public Function Init(Optional ListenAddress As String, Optional ByVal ListenPort
     '--- success
     Init = True
 QH:
+End Function
+
+'--- canal de controle local (selecao de monitor): LIST / SET <n> / STATUS
+Public Function InitControl(Optional ByVal ListenPort As Long = 35904, Optional ByVal ListenAddress As String = "127.0.0.1") As Boolean
+    If Not m_oCtrlSocket Is Nothing Then
+        InitControl = True
+        Exit Function
+    End If
+    Set m_oCtrlSocket = New cAsyncSocket
+    If Not m_oCtrlSocket.Create(SocketAddress:=ListenAddress, SocketPort:=ListenPort) Then
+        Set m_oCtrlSocket = Nothing
+        Exit Function
+    End If
+    If Not m_oCtrlSocket.Listen() Then
+        m_oCtrlSocket.Close_
+        Set m_oCtrlSocket = Nothing
+        Exit Function
+    End If
+    InitControl = True
+End Function
+
+Private Function pvCtrlFormatDeviceList() As String
+    Dim cDevices        As Collection
+    Dim vDevice         As Variant
+    Dim lIdx            As Long
+    Dim sOut            As String
+    Dim sName           As String
+    '
+    Set cDevices = pvCaptureEnumDevices()
+    sOut = "OK " & cDevices.Count & " " & m_lDeviceIndex
+    For lIdx = 1 To cDevices.Count
+        vDevice = cDevices.Item(lIdx)
+        sName = Replace(At(vDevice, 0), " ", "_")
+        sOut = sOut & " " & (lIdx - 1) & ":" & sName & ":" & At(vDevice, 2) & "x" & At(vDevice, 3) & _
+            ":" & At(vDevice, 4) & "," & At(vDevice, 5)
+    Next
+    pvCtrlFormatDeviceList = sOut & vbLf
+End Function
+
+Private Function pvHandleControlLine(ByVal sLine As String) As String
+    Dim sCmd            As String
+    Dim sArg            As String
+    Dim lIdx            As Long
+    Dim p               As Long
+    '
+    p = InStr(1, sLine, " ")
+    If p = 0 Then
+        sCmd = UCase$(sLine)
+    Else
+        sCmd = UCase$(Left$(sLine, p - 1))
+        sArg = Trim$(Mid$(sLine, p + 1))
+    End If
+    Select Case sCmd
+    Case "LIST"
+        pvHandleControlLine = pvCtrlFormatDeviceList()
+    Case "STATUS"
+        pvHandleControlLine = "OK " & m_lDeviceIndex & " " & m_uCaptureCtx.Width & "x" & m_uCaptureCtx.Height & vbLf
+    Case "SET"
+        If Not IsNumeric(sArg) Then
+            pvHandleControlLine = "ERRO argumento invalido" & vbLf
+            Exit Function
+        End If
+        lIdx = CLng(sArg)
+        If frCaptureSelectDevice(lIdx) Then
+            pvHandleControlLine = "OK " & lIdx & " " & m_uCaptureCtx.Width & "x" & m_uCaptureCtx.Height & vbLf
+        Else
+            pvHandleControlLine = "ERRO falha ao selecionar monitor " & lIdx & vbLf
+        End If
+    Case Else
+        pvHandleControlLine = "ERRO comando desconhecido" & vbLf
+    End Select
 End Function
 
 Public Function TextChatMsg(ByVal ConnID As Long, ByVal MsgType As Long, Optional MsgText As String) As Boolean
@@ -1972,8 +2056,9 @@ Private Function pvHandlePointerEvent(ByVal lLeft As Long, ByVal lTop As Long, u
     Dim lWidth          As Long
     Dim lHeight         As Long
     Dim lFlags          As Long
+    Dim lFlagsVirtual   As Long
     Dim lWheel          As Long
-    
+    '
     #If ImplConsole Then
         If pvParent.frConsoleHandlePointerEvent(uEvent) Then
             '--- success
@@ -1981,8 +2066,25 @@ Private Function pvHandlePointerEvent(ByVal lLeft As Long, ByVal lTop As Long, u
             GoTo QH
         End If
     #End If
-    lWidth = GetSystemMetrics(SM_CXSCREEN)
-    lHeight = GetSystemMetrics(SM_CYSCREEN)
+    '--- normaliza para o desktop virtual (monitor secundario incluso)
+    lWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    lHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    If lWidth <= 1 Or lHeight <= 1 Then
+        lWidth = GetSystemMetrics(SM_CXSCREEN)
+        lHeight = GetSystemMetrics(SM_CYSCREEN)
+        lLeft = 0
+        lTop = 0
+    Else
+        lLeft = lLeft - GetSystemMetrics(SM_XVIRTUALSCREEN)
+        lTop = lTop - GetSystemMetrics(SM_YVIRTUALSCREEN)
+        lFlagsVirtual = MOUSEEVENTF_VIRTUALDESK
+    End If
+    If lWidth < 2 Then
+        lWidth = 2
+    End If
+    If lHeight < 2 Then
+        lHeight = 2
+    End If
     If GetSystemMetrics(SM_SWAPBUTTON) = 0 Then
         LNG_BUTTON1 = 2 ^ 0
         LNG_BUTTON3 = 2 ^ 2
@@ -1991,7 +2093,7 @@ Private Function pvHandlePointerEvent(ByVal lLeft As Long, ByVal lTop As Long, u
         LNG_BUTTON3 = 2 ^ 0
     End If
     With uEvent
-        lFlags = MOUSEEVENTF_ABSOLUTE Or MOUSEEVENTF_MOVE
+        lFlags = MOUSEEVENTF_ABSOLUTE Or MOUSEEVENTF_MOVE Or lFlagsVirtual
         If (.ButtonMask And LNG_BUTTON1) <> (m_uClientPointerEvent.ButtonMask And LNG_BUTTON1) Then
             lFlags = lFlags Or IIf((.ButtonMask And LNG_BUTTON1) <> 0, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
         End If
@@ -2765,13 +2867,15 @@ End Function
 Friend Sub frCaptureSetupDeviceIndex(Optional ByVal Rotate As Long)
     Dim vDevice         As Variant
     Dim oConn           As cVncServer
-    
-    With pvCaptureEnumDevices()
-        If .Count > 0 Then
-            m_lDeviceIndex = (m_lDeviceIndex + Rotate) Mod .Count
-            vDevice = .Item(m_lDeviceIndex + 1)
-        End If
-    End With
+    Dim cDevices        As Collection
+    Dim lCount          As Long
+    '
+    Set cDevices = pvCaptureEnumDevices()
+    lCount = cDevices.Count
+    If lCount > 0 Then
+        m_lDeviceIndex = (m_lDeviceIndex + Rotate) Mod lCount
+        vDevice = cDevices.Item(m_lDeviceIndex + 1)
+    End If
     If pvCaptureInit(m_uCaptureCtx, At(vDevice, 0), 1) Then
         For Each oConn In m_cConnections
             oConn.frNotifyChangeDesktopSize
@@ -2779,6 +2883,27 @@ Friend Sub frCaptureSetupDeviceIndex(Optional ByVal Rotate As Long)
     End If
     m_lUltCursorShapeSize = 0
 End Sub
+
+'--- seleciona um monitor pelo indice (usado pelo canal de controle local)
+Friend Function frCaptureSelectDevice(ByVal lIndex As Long) As Boolean
+    Dim vDevice         As Variant
+    Dim oConn           As cVncServer
+    Dim cDevices        As Collection
+    '
+    Set cDevices = pvCaptureEnumDevices()
+    If lIndex < 0 Or lIndex >= cDevices.Count Then
+        Exit Function
+    End If
+    m_lDeviceIndex = lIndex
+    vDevice = cDevices.Item(lIndex + 1)
+    If pvCaptureInit(m_uCaptureCtx, At(vDevice, 0), 1) Then
+        For Each oConn In m_cConnections
+            oConn.frNotifyChangeDesktopSize
+        Next
+        m_lUltCursorShapeSize = 0
+        frCaptureSelectDevice = True
+    End If
+End Function
 
 Private Function pvCaptureEnumDevices() As Collection
     Const FUNC_NAME     As String = "pvCaptureEnumDevices"
@@ -2791,7 +2916,15 @@ Private Function pvCaptureEnumDevices() As Collection
     Dim pOutput         As IDXGIOutput1
     Dim uAdapterDesc    As DXGI_ADAPTER_DESC
     Dim uOutputDesc     As DXGI_OUTPUT_DESC
-    
+    Dim sDevice         As String
+    Dim hdc             As Long
+    Dim lWidth          As Long
+    Dim lHeight         As Long
+    Dim lLeft           As Long
+    Dim lTop            As Long
+    Dim lPhysW          As Long
+    Dim lPhysH          As Long
+    '
     On Error GoTo EH
     Set pvCaptureEnumDevices = New Collection
     LSet IID_IDXGIFactory1 = IIDFromString(szIID_IDXGIFactory1)
@@ -2809,15 +2942,33 @@ Private Function pvCaptureEnumDevices() As Collection
                 Exit For
             End If
             pOutput.GetDesc uOutputDesc
-            pvCaptureEnumDevices.Add Array(Replace(uOutputDesc.DeviceName, vbNullChar, vbNullString), _
-                Replace(uAdapterDesc.Description, vbNullChar, vbNullString))
+            sDevice = Replace(uOutputDesc.DeviceName, vbNullChar, vbNullString)
+            lWidth = uOutputDesc.DesktopCoordinates.Right - uOutputDesc.DesktopCoordinates.Left
+            lHeight = uOutputDesc.DesktopCoordinates.Bottom - uOutputDesc.DesktopCoordinates.Top
+            lLeft = uOutputDesc.DesktopCoordinates.Left
+            lTop = uOutputDesc.DesktopCoordinates.Top
+            '--- tamanho/origem em pixels fisicos (desfaz a escala de DPI)
+            hdc = CreateDC(0, StrPtr(sDevice), 0, 0)
+            If hdc <> 0 Then
+                lPhysW = GetDeviceCaps(hdc, DESKTOPHORZRES)
+                lPhysH = GetDeviceCaps(hdc, DESKTOPVERTRES)
+                Call DeleteDC(hdc)
+                If lPhysW > 0 And lPhysH > 0 And lWidth > 0 And lHeight > 0 Then
+                    lLeft = lLeft * lPhysW \ lWidth
+                    lTop = lTop * lPhysH \ lHeight
+                    lWidth = lPhysW
+                    lHeight = lPhysH
+                End If
+            End If
+            pvCaptureEnumDevices.Add Array(sDevice, _
+                Replace(uAdapterDesc.Description, vbNullChar, vbNullString), lWidth, lHeight, lLeft, lTop)
         Next
     Next
     #If ImplConsole Then
         If pvCaptureEnumDevices.Count = 0 Then
             pvCaptureEnumDevices.Add vbNullString
         End If
-        pvCaptureEnumDevices.Add Array("Console", "Console")
+        pvCaptureEnumDevices.Add Array("Console", "Console", 0, 0, 0, 0)
     #End If
     Exit Function
 EH:
@@ -2981,8 +3132,8 @@ Private Function pvCaptureInitGdi(uCtx As UcsCaptureContext, Optional ByVal bSec
     Const FUNC_NAME     As String = "pvCaptureInitGdi"
     Const DIB_RGB_COLORS As Long = 0
     Dim uBmpHeader      As BITMAPINFOHEADER
-Dim hDesktop        As Long
-
+    Dim hDesktop        As Long
+    '
     On Error GoTo EH
     '--- allow capture the secure desktop
     hDesktop = OpenInputDesktop(0, 0, GENERIC_READ)
@@ -2992,11 +3143,25 @@ Dim hDesktop        As Long
     End If
     Call pvCaptureTerminateGdi(uCtx)
     With uCtx
-        If .Width = 0 Or .Height = 0 Then
-            .Width = GetSystemMetrics(SM_CXSCREEN)
-            .Height = GetSystemMetrics(SM_CYSCREEN)
+        '--- DC do monitor selecionado (fallback: tela primaria)
+        If LenB(.DeviceName) <> 0 Then
+            .hScreenDC = CreateDC(0, StrPtr(.DeviceName), 0, 0)
+            .GdiDeviceDC = (.hScreenDC <> 0)
         End If
-        .hScreenDC = GetDC(0)
+        If .hScreenDC = 0 Then
+            .hScreenDC = GetDC(0)
+            .GdiDeviceDC = False
+        End If
+        If .Width = 0 Or .Height = 0 Then
+            If .hScreenDC <> 0 Then
+                .Width = GetDeviceCaps(.hScreenDC, DESKTOPHORZRES)
+                .Height = GetDeviceCaps(.hScreenDC, DESKTOPVERTRES)
+            End If
+            If .Width = 0 Or .Height = 0 Then
+                .Width = GetSystemMetrics(SM_CXSCREEN)
+                .Height = GetSystemMetrics(SM_CYSCREEN)
+            End If
+        End If
         .hMemDC = CreateCompatibleDC(.hScreenDC)
         With uBmpHeader
             .biSize = LenB(uBmpHeader)
@@ -3009,7 +3174,7 @@ Dim hDesktop        As Long
         .hDib = CreateDIBSection(.hMemDC, uBmpHeader, DIB_RGB_COLORS, .lpBits, 0, 0)
         If .hDib <> 0 Then
             .hOldDib = SelectObject(.hMemDC, .hDib)
-.GdiMode = True
+            .GdiMode = True
             .GdiSecureDesktop = bSecureDesktop
         End If
     End With
@@ -3067,10 +3232,15 @@ Private Sub pvCaptureTerminateGdi(uCtx As UcsCaptureContext)
             .hMemDC = 0
         End If
         If .hScreenDC <> 0 Then
-            Call ReleaseDC(0, .hScreenDC)
+            If .GdiDeviceDC Then
+                Call DeleteDC(.hScreenDC)
+            Else
+                Call ReleaseDC(0, .hScreenDC)
+            End If
             .hScreenDC = 0
         End If
-.GdiMode = False
+        .GdiDeviceDC = False
+        .GdiMode = False
         .GdiSecureDesktop = False
     End With
 End Sub
@@ -4726,6 +4896,59 @@ QH:
     Exit Sub
 EH:
     PrintError FUNC_NAME
+End Sub
+
+Private Sub m_oCtrlSocket_OnAccept()
+    Dim oSocket         As cAsyncSocket
+    
+    On Error GoTo EH
+    If Not m_oCtrlSocket.Accept(oSocket) Then
+        Exit Sub
+    End If
+    Set m_oCtrlConn = oSocket
+    m_sCtrlRecv = vbNullString
+    Exit Sub
+EH:
+    PrintError "m_oCtrlSocket_OnAccept"
+End Sub
+
+Private Sub m_oCtrlConn_OnReceive()
+    Dim sText           As String
+    Dim sLine           As String
+    Dim sReply          As String
+    Dim p               As Long
+    
+    On Error GoTo EH
+    If m_oCtrlConn Is Nothing Then
+        Exit Sub
+    End If
+    sText = m_oCtrlConn.ReceiveText()
+    If Len(sText) = 0 Then
+        Exit Sub
+    End If
+    m_sCtrlRecv = m_sCtrlRecv & sText
+    Do
+        p = InStr(1, m_sCtrlRecv, vbLf)
+        If p = 0 Then
+            Exit Do
+        End If
+        sLine = Trim$(Left$(m_sCtrlRecv, p - 1))
+        m_sCtrlRecv = Mid$(m_sCtrlRecv, p + 1)
+        If Len(sLine) > 0 Then
+            sReply = pvHandleControlLine(sLine)
+            If Len(sReply) > 0 Then
+                m_oCtrlConn.SendText sReply
+            End If
+        End If
+    Loop
+    Exit Sub
+EH:
+    PrintError "m_oCtrlConn_OnReceive"
+End Sub
+
+Private Sub m_oCtrlConn_OnClose()
+    Set m_oCtrlConn = Nothing
+    m_sCtrlRecv = vbNullString
 End Sub
 
 Private Sub m_oSocket_OnReceive()
