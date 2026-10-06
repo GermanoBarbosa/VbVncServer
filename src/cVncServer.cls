@@ -26,6 +26,7 @@ DefObj A-Z
 Private Const MODULE_NAME As String = "cVncServer"
 
 #Const ImplFileTransfer = (VNC_NO_FILE_TRANSFER = 0)
+#Const ImplTransferLog = (TRANSFER_LOG <> 0)
 #Const ImplTextChat = (VNC_NO_TEXT_CHAT = 0)
 #Const ImplConsole = (VNC_NO_CONSOLE = 0)
 #Const ImplZlib = (VNC_NO_ZLIB = 0)
@@ -815,6 +816,8 @@ Private m_pFtpSendChecksums     As stdole.IUnknown
 Private m_sFtpSendArchiveFile   As String
 Private m_sFtpRecvFileName      As String
 Private m_pFtpRecvStream        As stdole.IUnknown
+Private m_sFtpSendUserPath      As String
+Private m_cFtpSendSize          As Currency
 #If ImplConsole Then
     Private m_aColors(0 To 15)  As Long
 #End If
@@ -2182,6 +2185,9 @@ Private Function pvSendFileTransferFileContent(uOutput As UcsBuffer, pStream As 
             If Not pvSendFileTransfer(uOutput, rfbFtpAbortFileTransfer) Then
                 GoTo QH
             End If
+            pvFileTransferLog "down", "erro", m_sFtpSendUserPath, m_cFtpSendSize
+            m_sFtpSendUserPath = vbNullString
+            m_cFtpSendSize = 0
 Cleanup:
             Set pStream = Nothing
             Call DeleteFile(StrPtr(sArchiveFile))
@@ -2192,6 +2198,9 @@ Cleanup:
             If Not pvSendFileTransfer(uOutput, rfbFtpEndOfFile) Then
                 GoTo QH
             End If
+            pvFileTransferLog "down", "ok", m_sFtpSendUserPath, m_cFtpSendSize
+            m_sFtpSendUserPath = vbNullString
+            m_cFtpSendSize = 0
             GoTo Cleanup
         End If
         If pChecksums Is Nothing Then
@@ -2223,6 +2232,18 @@ QH:
 EH:
     PrintError FUNC_NAME
 End Function
+
+' pvFileTransferLog reporta o evento de transferencia de arquivo ao host
+' (FileTransferLog, definido no modulo principal). O corpo e removido quando
+' TRANSFER_LOG nao esta definido (ex.: projeto de teste do VbVncServer).
+Private Sub pvFileTransferLog(ByVal sDirecao As String, ByVal sResultado As String, _
+                              ByVal sCaminho As String, ByVal cTamanho As Currency)
+    #If ImplTransferLog Then
+        If LenB(sCaminho) = 0 Then Exit Sub
+        On Error Resume Next
+        FileTransferLog sDirecao, sResultado, sCaminho, cTamanho
+    #End If
+End Sub
 
 Private Function pvHandleFileTransfer(uOutput As UcsBuffer, uMsg As RfbFileTransfer, baData() As Byte) As Boolean
     Const FUNC_NAME     As String = "pvHandleFileTransfer"
@@ -2364,6 +2385,8 @@ Private Function pvHandleFileTransfer(uOutput As UcsBuffer, uMsg As RfbFileTrans
         m_bFtpSendRunning = False
         Set m_pFtpSendStream = Nothing
         m_sFtpSendArchiveFile = vbNullString
+        m_sFtpSendUserPath = sPath
+        m_cFtpSendSize = 0
         #If ImplZlib Then
             If GetFileAttributes(StrPtr(sPath)) = -1 Then
                 sTemp = Mid$(sPath, InStrRev(sPath, "\") + 1)
@@ -2390,6 +2413,12 @@ Private Function pvHandleFileTransfer(uOutput As UcsBuffer, uMsg As RfbFileTrans
         Else
             sPath = sPath & "," & Format$(pvGetFileDateTime(sPath), FORMAT_FILEDATETIME)
         End If
+        If cStreamSize = ERROR_VALUE Then
+            pvFileTransferLog "down", "erro", m_sFtpSendUserPath, 0
+            m_sFtpSendUserPath = vbNullString
+        Else
+            m_cFtpSendSize = cStreamSize * 10000@
+        End If
         Call CopyMemory(uStreamSize, cStreamSize, 8)
         baBuffer = StrConv(sPath, vbFromUnicode, GetSystemDefaultLCID())
         If Not pvSendFileTransfer(uOutput, rfbFtpFileHeader, 0, _
@@ -2404,6 +2433,9 @@ Private Function pvHandleFileTransfer(uOutput As UcsBuffer, uMsg As RfbFileTrans
         If uMsg.Size = rfbFtpSErrorCmd Then
             Set m_pFtpSendStream = Nothing
             Call DeleteFile(StrPtr(m_sFtpSendArchiveFile))
+            pvFileTransferLog "down", "erro", m_sFtpSendUserPath, 0
+            m_sFtpSendUserPath = vbNullString
+            m_cFtpSendSize = 0
         Else
             m_bFtpSendRunning = True
         End If
@@ -2438,6 +2470,10 @@ SkipChecksums:
         If pvCheckHResult(pvCreateStreamOnFile(m_sFtpRecvFileName, STGM_WRITE Or lIdx, m_pFtpRecvStream), FUNC_NAME) < 0 Then
             eStatus = rfbFtpSErrorCmd
         End If
+        If eStatus = rfbFtpSErrorCmd Then
+            pvFileTransferLog "up", "erro", m_sFtpRecvFileName, 0
+            m_sFtpRecvFileName = vbNullString
+        End If
         baBuffer = StrConv(m_sFtpRecvFileName, vbFromUnicode, GetSystemDefaultLCID())
         If Not pvSendFileTransfer(uOutput, rfbFtpFileAcceptHeader, ContentSize:=eStatus, _
                 Ptr:=pvArrayPtr(baBuffer), Size:=pvArraySize(baBuffer)) Then
@@ -2446,6 +2482,8 @@ SkipChecksums:
     Case rfbFtpFilePacket
         If m_pFtpRecvStream Is Nothing Then
 AbortRecv:
+            pvFileTransferLog "up", "abortado", m_sFtpRecvFileName, 0
+            m_sFtpRecvFileName = vbNullString
             Set m_pFtpRecvStream = Nothing
             pvSendFileTransfer uOutput, rfbFtpAbortFileTransfer
             GoTo QH
@@ -2493,6 +2531,11 @@ AbortRecv:
         If cStreamSize >= 0 Then
             SetFileLen m_sFtpRecvFileName, cStreamSize * 10000@
         End If
+        If cStreamSize > 0 Then
+            pvFileTransferLog "up", "ok", m_sFtpRecvFileName, cStreamSize * 10000@
+        Else
+            pvFileTransferLog "up", "ok", m_sFtpRecvFileName, 0
+        End If
         #If ImplZlib Then
             If Right$(m_sFtpRecvFileName, sizeof_ZIP_SUFFIX) = STR_ZIP_SUFFIX Then
                 sPath = Mid$(m_sFtpRecvFileName, InStrRev(m_sFtpRecvFileName, "\") + 1)
@@ -2507,24 +2550,38 @@ AbortRecv:
                 End If
             End If
         #End If
+        m_sFtpRecvFileName = vbNullString
     Case rfbFtpAbortFileTransfer
         If Not m_pFtpSendStream Is Nothing Then
             Set m_pFtpSendStream = Nothing
+            pvFileTransferLog "down", "abortado", m_sFtpSendUserPath, 0
+            m_sFtpSendUserPath = vbNullString
+            m_cFtpSendSize = 0
             Call DeleteFile(StrPtr(m_sFtpSendArchiveFile))
             If Not pvSendFileTransfer(uOutput, rfbFtpAbortFileTransfer) Then
                 GoTo QH
             End If
         ElseIf Not m_pFtpRecvStream Is Nothing Then
             Set m_pFtpRecvStream = Nothing
+            pvFileTransferLog "up", "abortado", m_sFtpRecvFileName, 0
+            m_sFtpRecvFileName = vbNullString
         ElseIf Not pvSendFileTransfer(uOutput, IIf(uMsg.ContentParam = 0, rfbFtpAbortFileTransfer, rfbFtpFileTransferAccess), _
                 ContentParam:=rfbFtpProtocolVersion, ContentSize:=rfbFtpSProtocolEnabled) Then
             GoTo QH
         End If
     Case rfbFtpFileTransferSessionStart, rfbFtpFileTransferSessionEnd
+        If Not m_pFtpSendStream Is Nothing Then
+            pvFileTransferLog "down", "abortado", m_sFtpSendUserPath, 0
+        End If
+        If Not m_pFtpRecvStream Is Nothing Then
+            pvFileTransferLog "up", "abortado", m_sFtpRecvFileName, 0
+        End If
         m_bFtpSendRunning = False
         Set m_pFtpSendStream = Nothing
         Set m_pFtpSendChecksums = Nothing
         m_sFtpSendArchiveFile = vbNullString
+        m_sFtpSendUserPath = vbNullString
+        m_cFtpSendSize = 0
         m_sFtpRecvFileName = vbNullString
         Set m_pFtpRecvStream = Nothing
     End Select
